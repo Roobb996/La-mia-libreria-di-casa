@@ -167,9 +167,14 @@ textarea.field { border-radius: 16px; resize: none; }
 }
 .isbn-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: center;
 }
+.isbn-row .field { flex: 1 1 100%; min-width: 0; }
+.isbn-row .btn { flex: 1 1 auto; }
+.linklike { text-align: left; text-decoration: underline; padding: 4px 0; touch-action: manipulation; }
+#isbnStatus:empty { display: none; }
 .scanner-container {
   position: relative;
   width: 100%;
@@ -227,5 +232,3 @@ textarea.field { border-radius: 16px; resize: none; }
   .footer { padding-bottom: 32px; }
 }
 @keyframes sheetup { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
-
-
