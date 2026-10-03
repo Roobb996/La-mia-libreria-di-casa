@@ -111,40 +111,163 @@
     return { ...c, ts, score: ts + as + Math.min(c.editions, 50) / 50 };
   }
 
-  function searchCovers(title, author) {
-    const key = norm(title) + "|" + norm(author);
-    if (coverCache.has(key)) return coverCache.get(key);
-    const p = (async () => {
-      const queries = [];
-      if (author) queries.push({ title, author });
-      queries.push({ q: `${title} ${author}`.trim() });
-      if (author) queries.push({ title });
-      const seen = new Map();
-      let errors = 0;
-      for (const qy of queries) {
-        try {
-          const params = new URLSearchParams({ ...qy, limit: "15", fields: OL_FIELDS });
-          const data = await getJSON(`https://openlibrary.org/search.json?${params}`);
-          for (const d of data.docs || []) {
-            if (!d.cover_i || seen.has(d.cover_i)) continue;
-            seen.set(d.cover_i, { id: d.cover_i, title: d.title || "", authors: d.author_name || [], year: d.first_publish_year, editions: d.edition_count || 0 });
-          }
-        } catch { errors++; }
-        if (seen.size >= 6) break;
-      }
-      const list = [...seen.values()].map((c) => rank(c, title, author)).sort((x, y) => y.score - x.score);
-      return { list, failed: errors === queries.length };
-    })();
-    coverCache.set(key, p);
-    p.then((r) => { if (r.failed) coverCache.delete(key); });
-    return p;
-  }
-
   // ---------- fonti per la ricerca da ISBN ----------
   // Indirizzo del proprio proxy (vedi worker.js), ad es. "https://isbn-proxy.tuonome.workers.dev".
   // Se impostato, SBN e Google Books passano da lì: niente blocchi CORS e niente limite di richieste.
   const ISBN_PROXY = "https://round-cloud-60d5.burba1996.workers.dev";
   const viaProxy = (url) => (ISBN_PROXY ? `${ISBN_PROXY.replace(/\/$/, "")}/?url=${encodeURIComponent(url)}` : url);
+
+  // ---------- ricerca copertine (multi-fonte) ----------
+  // Ogni candidato: { key, thumb, url, title, authors, year, editions, source }
+  async function coversFromOpenLibrary(title, author) {
+    const queries = [];
+    if (author) queries.push({ title, author });
+    queries.push({ q: `${title} ${author}`.trim() });
+    if (author) queries.push({ title });
+    const seen = new Map();
+    let errors = 0;
+    for (const qy of queries) {
+      try {
+        const params = new URLSearchParams({ ...qy, limit: "15", fields: OL_FIELDS });
+        const data = await getJSON(`https://openlibrary.org/search.json?${params}`);
+        for (const d of data.docs || []) {
+          if (!d.cover_i || seen.has(d.cover_i)) continue;
+          seen.set(d.cover_i, {
+            key: "ol" + d.cover_i,
+            thumb: coverImg(d.cover_i, "M"),
+            url: coverImg(d.cover_i, "L"),
+            title: d.title || "",
+            authors: d.author_name || [],
+            year: d.first_publish_year,
+            editions: d.edition_count || 0,
+            source: "Open Library",
+          });
+        }
+      } catch { errors++; }
+      if (seen.size >= 6) break;
+    }
+    if (errors === queries.length) throw new Error("Open Library non raggiungibile");
+    return [...seen.values()];
+  }
+
+  // JSONP: aggira CORS (anche da file:// o origine "null") per API che lo supportano, come iTunes.
+  function jsonp(url, ms = 8000) {
+    return new Promise((resolve, reject) => {
+      const cb = "__jsonp" + Math.random().toString(36).slice(2);
+      const s = document.createElement("script");
+      const t = setTimeout(() => done(new Error("timeout")), ms);
+      function done(err, data) {
+        clearTimeout(t);
+        delete window[cb];
+        s.remove();
+        err ? reject(err) : resolve(data);
+      }
+      window[cb] = (d) => done(null, d);
+      s.onerror = () => done(new Error("jsonp"));
+      s.src = url + (url.includes("?") ? "&" : "?") + "callback=" + cb;
+      document.head.appendChild(s);
+    });
+  }
+
+  // Chiave API di Google Books (gratuita, console.cloud.google.com): evita il 429 della quota condivisa.
+  // Restringila alle sole "Books API" e al tuo dominio.
+  const GOOGLE_API_KEY = "";
+  let googleCooldownUntil = 0; // dopo un 429 si salta Google Books per qualche minuto
+
+  async function coversFromGoogleBooks(title, author) {
+    if (Date.now() < googleCooldownUntil) throw new Error("429");
+    const queries = [
+      author ? `intitle:"${title}" inauthor:"${author}"` : `intitle:"${title}"`,
+      `${title} ${author}`.trim(),
+    ];
+    for (const q of queries) {
+      let api = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=20&printType=books&fields=items(id,volumeInfo(title,authors,publishedDate,imageLinks))`;
+      if (GOOGLE_API_KEY) api += `&key=${GOOGLE_API_KEY}`;
+      let data;
+      try { data = await getJSON(viaProxy(api)); }
+      catch (err) {
+        if (String(err && err.message) === "429") googleCooldownUntil = Date.now() + 5 * 60 * 1000;
+        throw err;
+      }
+      const out = (data.items || [])
+        .filter((it) => it.volumeInfo && it.volumeInfo.imageLinks)
+        .map((it) => {
+          const v = it.volumeInfo;
+          const img = `https://books.google.com/books/content?id=${it.id}&printsec=frontcover&img=1&zoom=1`;
+          return {
+            key: "gb" + it.id, thumb: img, url: img,
+            title: v.title || "", authors: v.authors || [],
+            year: ((v.publishedDate || "").match(/\d{4}/) || [])[0] || "",
+            editions: 0, source: "Google Books",
+          };
+        });
+      if (out.length) return out;
+    }
+    return [];
+  }
+
+  async function coversFromApple(title, author) {
+    const params = new URLSearchParams({
+      term: `${title} ${author}`.trim(), media: "ebook", entity: "ebook", country: "it", limit: "10",
+    });
+    const data = await jsonp(`https://itunes.apple.com/search?${params}`);
+    return (data.results || [])
+      .filter((r) => r.artworkUrl100)
+      .map((r) => ({
+        key: "ap" + r.trackId,
+        thumb: r.artworkUrl100.replace("100x100bb", "300x300bb"),
+        url: r.artworkUrl100.replace("100x100bb", "600x600bb"),
+        title: r.trackName || "", authors: [r.artistName || ""],
+        year: (r.releaseDate || "").slice(0, 4),
+        editions: 0, source: "Apple Books",
+      }));
+  }
+
+  // SBN: i record con ISBN includono "copertina" (link LibraryThing, in http e taglia "small").
+  async function coversFromSbn(title, author) {
+    const q = `${title} ${author}`.trim();
+    const url = `https://opac.sbn.it/opacmobilegw/search.json?any=${encodeURIComponent(q)}`;
+    const data = await getSbnJSON(url);
+    const out = [], seen = new Set();
+    for (const r of (data && data.briefRecords) || []) {
+      const isbn = String(r.isbn || "").replace(/[^0-9X]/gi, "");
+      if (!r.titolo || !r.copertina || !isbn || seen.has(isbn)) continue;
+      seen.add(isbn);
+      const base = String(r.copertina).replace(/^http:/, "https:");
+      const years = String(r.pubblicazione || "").match(/\b(1[5-9]\d{2}|20\d{2})\b/g);
+      out.push({
+        key: "sbn" + isbn,
+        thumb: base.replace("/small/", "/medium/"),
+        url: base.replace("/small/", "/large/"),
+        title: parseSbnTitle(r.titolo),
+        authors: [parseSbnAuthor(r.autorePrincipale)],
+        year: years ? years[years.length - 1] : "",
+        editions: 0,
+        source: "SBN",
+      });
+    }
+    return out.slice(0, 10);
+  }
+
+  const COVER_SOURCES = [coversFromOpenLibrary, coversFromGoogleBooks, coversFromApple, coversFromSbn];
+
+  function searchCovers(title, author) {
+    const key = norm(title) + "|" + norm(author);
+    if (coverCache.has(key)) return coverCache.get(key);
+    const p = (async () => {
+      const results = await Promise.allSettled(COVER_SOURCES.map((fn) => fn(title, author)));
+      const seen = new Map();
+      for (const r of results) {
+        if (r.status !== "fulfilled") continue;
+        for (const c of r.value) if (!seen.has(c.key)) seen.set(c.key, c);
+      }
+      const list = [...seen.values()].map((c) => rank(c, title, author)).sort((x, y) => y.score - x.score);
+      return { list, failed: results.every((r) => r.status === "rejected") };
+    })();
+    coverCache.set(key, p);
+    p.then((r) => { if (r.failed) coverCache.delete(key); });
+    return p;
+  }
 
   const SOURCE_LABELS = {
     fromSbn: "SBN",
@@ -217,8 +340,8 @@
     const title = parseSbnTitle(rec.titolo);
     if (!title) return null;
     const years = String(rec.pubblicazione || "").match(/\b(1[5-9]\d{2}|20\d{2})\b/g);
-    // nessuna copertina da SBN: ci pensa la ricerca automatica su Open Library
-    return { title, author: parseSbnAuthor(rec.autorePrincipale), year: years ? years[years.length - 1] : "" };
+    const coverUrl = rec.copertina ? String(rec.copertina).replace(/^http:/, "https:").replace("/small/", "/large/") : undefined;
+    return { title, author: parseSbnAuthor(rec.autorePrincipale), year: years ? years[years.length - 1] : "", coverUrl };
   }
 
   async function fromOpenLibrary(isbn) {
@@ -397,7 +520,7 @@
   async function autoCover(title, author) {
     const { list, failed } = await searchCovers(title, author);
     for (const c of list.filter((x) => x.ts >= 2).slice(0, 3)) {
-      if (await probe(coverImg(c.id, "M"))) return { url: coverImg(c.id, "L"), failed: false };
+      if (await probe(c.thumb)) return { url: c.url, failed: false };
     }
     return { url: undefined, failed };
   }
@@ -460,7 +583,7 @@
   }
   const badges = (b) => b.flags.map((f) => `<span class="badge f-${f}">${FLAGS[f]}</span>`).join("");
 
-function renderHome() {
+  function renderHome() {
     const q = search.trim().toLowerCase();
     const visible = books.filter((b) => {
       for (const f of activeFilters) if (!b.flags.includes(f)) return false;
@@ -601,14 +724,14 @@ function renderHome() {
       const preview = f.coverUrl ? `<img class="preview" src="${esc(sized(f.coverUrl, "M"))}" alt="Copertina scelta">` : `<div class="preview"></div>`;
       let picker = "";
       if (loading) {
-        picker = `<div class="picker">${'<div class="pick sk"></div>'.repeat(6)}</div><p class="small">Cerco su Open Library…</p>`;
+        picker = `<div class="picker">${'<div class="pick sk"></div>'.repeat(6)}</div><p class="small">Cerco su Open Library, Google Books e Apple Books…</p>`;
       } else if (cs.state === "done") {
         picker = `<p class="small">Tocca la copertina giusta</p><div class="picker">${cs.list.map((c, i) => {
-          const sel = f.coverUrl && String(f.coverUrl).includes(`/${c.id}-`);
-          const titleAttr = c.year ? `${esc(c.title)} ·${c.year}` : esc(c.title);
+          const sel = f.coverUrl && sized(f.coverUrl, "L") === sized(c.url, "L");
+          const titleAttr = esc([c.title, c.year, c.source].filter(Boolean).join(" · "));
           const bestBadge = i === 0 && c.ts >= 2 ? '<span class="best">Consigliata</span>' : '';
-          return `<button type="button" class="pick${sel ? ' sel' : ''}" data-pick="${c.id}" title="${titleAttr}">
-            <img src="${coverImg(c.id, 'M')}" alt="${esc(c.title)}" loading="lazy" onerror="this.closest('.pick').remove()">
+          return `<button type="button" class="pick${sel ? ' sel' : ''}" data-pick="${i}" title="${titleAttr}">
+            <img src="${esc(c.thumb)}" alt="${esc(c.title)}" loading="lazy" onerror="this.closest('.pick').remove()">
             ${bestBadge}</button>`;
         }).join('')}</div>`;
       } else if (cs.msg) {
@@ -637,7 +760,7 @@ function renderHome() {
       if (seq !== searchSeq || modal.hidden) return;
       cs = list.length
         ? { state: "done", list: list.slice(0, 9), msg: "" }
-        : { state: "none", list: [], msg: failed ? "Connessione a Open Library non riuscita. Riprova." : "Nessuna copertina trovata. Controlla titolo e autore." };
+        : { state: "none", list: [], msg: failed ? "Connessione alle fonti di copertine non riuscita. Riprova." : "Nessuna copertina trovata. Controlla titolo e autore." };
       renderCoverBox();
     }
 
@@ -843,7 +966,10 @@ function renderHome() {
       } else if (t.dataset?.star) {
         sync(); f.rating = Number(t.dataset.star); draw();
       } else if (t.dataset?.pick) {
-        sync(); f.coverUrl = coverImg(t.dataset.pick, "L"); renderCoverBox();
+        sync();
+        const c = cs.list[Number(t.dataset.pick)];
+        if (c) f.coverUrl = c.url;
+        renderCoverBox();
       } else if (t.hasAttribute?.("data-nocover")) {
         sync(); f.coverUrl = ""; renderCoverBox();
       } else if (t.hasAttribute?.("data-cover")) {
