@@ -224,9 +224,10 @@ textarea.field { border-radius: 16px; resize: none; }
   .feel .word { font-size: 30px; }
   .actions .btn { flex: 1 1 auto; text-align: center; }
   .overlay { padding: 0; align-items: end; }
-  .sheet { max-width: none; max-height: 94dvh; border-radius: 24px 24px 0 0; padding: 20px 16px calc(20px + env(safe-area-inset-bottom)); animation: sheetup .3s both; }
+  .sheet { max-width: none; max-height: 94dvh; border-radius: 24px 24px 0 0; padding: 20px 16px 0; animation: sheetup .3s both; }
   .field { font-size: 16px; padding: 10px 16px; }
-  .formfoot { position: sticky; bottom: -20px; background: var(--surface); padding: 12px 0 4px; }
+  .form { display: flex; flex-direction: column; }
+  .formfoot { position: sticky; bottom: 0; z-index: 2; background: var(--surface); border-top: 1px solid var(--border); margin-top: 4px; padding: 12px 0 calc(12px + env(safe-area-inset-bottom, 0px)); }
   .formfoot .btn { flex: 1; }
   .picker { grid-template-columns: repeat(3, 1fr); }
   .footer { padding-bottom: 32px; }
