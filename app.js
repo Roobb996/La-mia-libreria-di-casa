@@ -140,38 +140,158 @@
     return p;
   }
 
+  // ---------- fonti per la ricerca da ISBN ----------
+  // Catalogo SBN (Servizio Bibliotecario Nazionale): il database delle biblioteche italiane.
+  // I titoli sono in formato ISBD ("Titolo : sottotitolo / responsabilità") e gli autori "Cognome, Nome".
+  const isItalianIsbn = (isbn) => /^(97888|97912)/.test(isbn);
+
+  function parseSbnTitle(raw) {
+    return String(raw || "")
+      .split(" / ")[0]            // toglie la menzione di responsabilità
+      .replace(/<<|>>/g, "")      // articoli iniziali "<<La >>casa" -> "La casa"
+      .replace(/\s+:\s+/g, ": ")  // " : sottotitolo" -> ": sottotitolo"
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+  function parseSbnAuthor(raw) {
+    const s = String(raw || "").replace(/<<|>>/g, "").trim();
+    if (!s) return "";
+    const i = s.indexOf(",");
+    // "Orwell, George" -> "George Orwell"; elimina date tra parentesi tonde/angolari o in coda
+    const clean = (x) => x.replace(/\(.*?\)|<.*?>/g, "").replace(/[,\s]*\d{3,4}.*$/, "").trim();
+    return i === -1 ? clean(s) : `${clean(s.slice(i + 1))} ${clean(s.slice(0, i))}`.trim();
+  }
+
+  // Se il browser blocca SBN (CORS) si ripiega su proxy pubblici, che vedono solo l'ISBN cercato.
+  const SBN_PROXIES = [
+    (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    (u) => `https://corsproxy.io/?url=${encodeURIComponent(u)}`,
+  ];
+  let sbnDirectBlocked = false;
+
+  async function getSbnJSON(url) {
+    if (!sbnDirectBlocked) {
+      try { return await getJSON(url, 6000); }
+      catch (err) {
+        // un errore di rete/CORS arriva come TypeError: inutile riprovare in diretta
+        if (err instanceof TypeError) sbnDirectBlocked = true;
+        console.warn("SBN diretto non riuscito:", err);
+      }
+    }
+    let lastErr;
+    for (const wrap of SBN_PROXIES) {
+      try { return await getJSON(wrap(url), 8000); }
+      catch (err) { lastErr = err; console.warn("SBN via proxy non riuscito:", err); }
+    }
+    throw lastErr || new Error("SBN non raggiungibile");
+  }
+
+  async function fromSbn(isbn) {
+    const data = await getSbnJSON(`https://opac.sbn.it/opacmobilegw/search.json?isbn=${isbn}`);
+    const records = (data && data.briefRecords) || [];
+    const digits = (x) => String(x || "").replace(/[^0-9X]/gi, "");
+    const rec = records.find((r) => digits(r.isbn) === isbn && r.titolo) || records.find((r) => r.titolo);
+    if (!rec) return null;
+    const title = parseSbnTitle(rec.titolo);
+    if (!title) return null;
+    const years = String(rec.pubblicazione || "").match(/\b(1[5-9]\d{2}|20\d{2})\b/g);
+    // nessuna copertina da SBN: ci pensa la ricerca automatica su Open Library
+    return { title, author: parseSbnAuthor(rec.autorePrincipale), year: years ? years[years.length - 1] : "" };
+  }
+
+  async function fromOpenLibrary(isbn) {
+    const data = await getJSON(`https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`);
+    const bookData = data[`ISBN:${isbn}`];
+    if (!bookData || !bookData.title) return null;
+    const title = bookData.title || "";
+    const author = bookData.authors ? bookData.authors.map((a) => a.name).join(", ") : "";
+    const year = bookData.publish_date ? (bookData.publish_date.match(/\d{4}/) || [])[0] || "" : "";
+    const coverUrl = bookData.cover ? bookData.cover.large || bookData.cover.medium : undefined;
+    return { title, author, year, coverUrl };
+  }
+
+  // ISBN-13 (978...) -> ISBN-10: molti archivi hanno indicizzato solo la vecchia forma.
+  function isbn13to10(isbn13) {
+    if (!/^978\d{10}$/.test(isbn13)) return null;
+    const body = isbn13.slice(3, 12);
+    let sum = 0;
+    for (let i = 0; i < 9; i++) sum += Number(body[i]) * (10 - i);
+    const check = (11 - (sum % 11)) % 11;
+    return body + (check === 10 ? "X" : String(check));
+  }
+
+  // Open Library, archivio per singola edizione: spesso ha libri che api/books non restituisce.
+  async function fromOpenLibraryEdition(isbn) {
+    const ed = await getJSON(`https://openlibrary.org/isbn/${isbn}.json`);
+    if (!ed || !ed.title) return null;
+    const title = ed.subtitle ? `${ed.title}: ${ed.subtitle}` : ed.title;
+    const year = ((ed.publish_date || "").match(/\d{4}/) || [])[0] || "";
+    const coverId = (ed.covers || []).find((c) => c > 0);
+    const coverUrl = coverId ? coverImg(coverId, "L") : undefined;
+
+    let keys = (ed.authors || []).map((a) => a.key).filter(Boolean);
+    if (!keys.length && ed.works && ed.works[0] && ed.works[0].key) {
+      try { // se l'edizione non ha autori, si guarda l'opera collegata
+        const work = await getJSON(`https://openlibrary.org${ed.works[0].key}.json`, 5000);
+        keys = (work.authors || []).map((a) => a.author && a.author.key).filter(Boolean);
+      } catch {}
+    }
+    const names = await Promise.all(
+      keys.slice(0, 3).map((k) => getJSON(`https://openlibrary.org${k}.json`, 5000).then((a) => a.name || "").catch(() => ""))
+    );
+    return { title, author: names.filter(Boolean).join(", "), year, coverUrl };
+  }
+
+  async function fromGoogleBooks(isbn) {
+    // Più tentativi: il filtro isbn: a volte manca un'edizione che la ricerca libera trova;
+    // le richieste che falliscono (es. limite di richieste) non fermano gli altri tentativi.
+    const isbn10 = isbn13to10(isbn);
+    const queries = [`isbn:${isbn}`, ...(isbn10 ? [`isbn:${isbn10}`] : []), isbn];
+    let info = null;
+    for (const q of queries) {
+      try {
+        const data = await getJSON(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=5`);
+        const items = data.items || [];
+        const hit = items.find((it) => {
+          const ids = ((it.volumeInfo && it.volumeInfo.industryIdentifiers) || []).map((x) => x.identifier);
+          return ids.includes(isbn) || (isbn10 && ids.includes(isbn10));
+        }) || (q.startsWith("isbn:") ? items[0] : null);
+        if (hit && hit.volumeInfo && hit.volumeInfo.title) { info = hit.volumeInfo; break; }
+      } catch {}
+    }
+    if (!info) return null;
+    const title = info.subtitle ? `${info.title}: ${info.subtitle}` : info.title;
+    const author = (info.authors || []).join(", ");
+    const year = ((info.publishedDate || "").match(/\d{4}/) || [])[0] || "";
+    const thumb = info.imageLinks && (info.imageLinks.thumbnail || info.imageLinks.smallThumbnail);
+    const coverUrl = thumb ? String(thumb).replace(/^http:/, "https:").replace("&edge=curl", "") : undefined;
+    return { title, author, year, coverUrl };
+  }
+
   async function fetchByISBN(isbn) {
-    const cleanIsbn = isbn.replace(/[^0-9X]/gi, "");
+    const cleanIsbn = isbn.replace(/[^0-9X]/gi, "").toUpperCase();
     if (!cleanIsbn) return null;
 
-    // 1) Open Library
-    try {
-      const data = await getJSON(`https://openlibrary.org/api/books?bibkeys=ISBN:${cleanIsbn}&format=json&jscmd=data`);
-      const bookData = data[`ISBN:${cleanIsbn}`];
-      if (bookData && bookData.title) {
-        const title = bookData.title || "";
-        const author = bookData.authors ? bookData.authors.map((a) => a.name).join(", ") : "";
-        const year = bookData.publish_date ? (bookData.publish_date.match(/\d{4}/) || [])[0] || "" : "";
-        const coverUrl = bookData.cover ? bookData.cover.large || bookData.cover.medium : undefined;
-        return { title, author, year, coverUrl };
-      }
-    } catch {}
+    // Per gli ISBN italiani (978-88 / 979-12) si parte dal catalogo SBN; poi le fonti internazionali.
+    const sources = isItalianIsbn(cleanIsbn)
+      ? [fromSbn, fromOpenLibrary, fromOpenLibraryEdition, fromGoogleBooks]
+      : [fromOpenLibrary, fromOpenLibraryEdition, fromGoogleBooks, fromSbn];
 
-    // 2) Google Books (copre meglio le edizioni italiane)
-    try {
-      const data = await getJSON(`https://www.googleapis.com/books/v1/volumes?q=isbn:${cleanIsbn}&maxResults=1`);
-      const info = data.items && data.items[0] && data.items[0].volumeInfo;
-      if (info && info.title) {
-        const title = info.subtitle ? `${info.title}: ${info.subtitle}` : info.title;
-        const author = (info.authors || []).join(", ");
-        const year = ((info.publishedDate || "").match(/\d{4}/) || [])[0] || "";
-        const thumb = info.imageLinks && (info.imageLinks.thumbnail || info.imageLinks.smallThumbnail);
-        const coverUrl = thumb ? String(thumb).replace(/^http:/, "https:").replace("&edge=curl", "") : undefined;
-        return { title, author, year, coverUrl };
+    let found = null;
+    for (const source of sources) {
+      try {
+        const r = await source(cleanIsbn);
+        if (!r) continue;
+        if (!found) found = r;
+        else { // completa i campi mancanti con la fonte successiva
+          for (const k of ["title", "author", "year", "coverUrl"]) if (!found[k] && r[k]) found[k] = r[k];
+        }
+        if (found.title && found.author && found.year) break;
+      } catch (err) { // fonte non raggiungibile o bloccata (es. CORS): si passa alla successiva
+        console.warn(`Ricerca ISBN: ${source.name} non riuscita`, err);
       }
-    } catch {}
-
-    return null;
+    }
+    return found;
   }
 
   // ---------- scanner helpers ----------
