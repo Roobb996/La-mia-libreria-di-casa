@@ -154,6 +154,48 @@ textarea.field { border-radius: 16px; resize: none; }
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; } }
 
+
+/* ---------- isbn scanner ---------- */
+.isbn-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: color-mix(in oklch, var(--foreground) 3%, transparent);
+  border: 1px dashed var(--border);
+  padding: 12px;
+  border-radius: 16px;
+}
+.isbn-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.scanner-container {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  background: #000;
+  border-radius: 12px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.scanner-container video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.scanner-guide {
+  position: absolute;
+  width: 75%;
+  height: 35%;
+  border: 2px dashed var(--sun);
+  border-radius: 8px;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+}
+
 /* ---------- mobile ---------- */
 @media (max-width: 640px) {
   .wrap { padding: 0 16px; }
@@ -185,3 +227,5 @@ textarea.field { border-radius: 16px; resize: none; }
   .footer { padding-bottom: 32px; }
 }
 @keyframes sheetup { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+
