@@ -19,7 +19,7 @@
   const MONTHS = ["gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"];
 
   let books = [];
-  const activeFilters = new Set(); // filtri attivi (toggle on/off, combinabili)
+  const activeFilters = new Set();
   let search = "";
 
   // ---------- utils ----------
@@ -67,8 +67,8 @@
   // ---------- Open Library ----------
   const OL_FIELDS = "title,author_name,first_publish_year,cover_i,edition_count";
   const coverCache = new Map();
-  const pending = new Set();   // libri in coda o in ricerca
-  const failedIds = new Set(); // errori di rete in questa sessione (si riprova al prossimo avvio)
+  const pending = new Set();
+  const failedIds = new Set();
 
   const norm = (s) =>
     String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
@@ -85,7 +85,7 @@
       return await res.json();
     } finally { clearTimeout(t); }
   }
-  // verifica che l'immagine esista davvero (niente placeholder 1x1)
+
   function probe(url, ms = 8000) {
     return new Promise((resolve) => {
       const img = new Image();
@@ -95,6 +95,7 @@
       img.src = url;
     });
   }
+
   function rank(c, title, author) {
     const t = norm(title), ct = norm(c.title);
     let ts = 0;
@@ -110,7 +111,6 @@
     return { ...c, ts, score: ts + as + Math.min(c.editions, 50) / 50 };
   }
 
-  // Restituisce { list, failed }: candidati con copertina, ordinati per pertinenza
   function searchCovers(title, author) {
     const key = norm(title) + "|" + norm(author);
     if (coverCache.has(key)) return coverCache.get(key);
@@ -140,7 +140,25 @@
     return p;
   }
 
-  // Scelta automatica: primo candidato pertinente la cui immagine si carica davvero
+  async function fetchByISBN(isbn) {
+    const cleanIsbn = isbn.replace(/[^0-9X]/gi, "");
+    if (!cleanIsbn) return null;
+    try {
+      const data = await getJSON(`https://openlibrary.org/api/books?bibkeys=ISBN:${cleanIsbn}&format=json&jscmd=data`);
+      const bookData = data[`ISBN:${cleanIsbn}`];
+      if (!bookData) return null;
+
+      const title = bookData.title || "";
+      const author = bookData.authors ? bookData.authors.map((a) => a.name).join(", ") : "";
+      const year = bookData.publish_date ? (bookData.publish_date.match(/\d{4}/) || [])[0] || "" : "";
+      const coverUrl = bookData.cover ? bookData.cover.large || bookData.cover.medium : undefined;
+
+      return { title, author, year, coverUrl };
+    } catch {
+      return null;
+    }
+  }
+
   async function autoCover(title, author) {
     const { list, failed } = await searchCovers(title, author);
     for (const c of list.filter((x) => x.ts >= 2).slice(0, 3)) {
@@ -149,7 +167,6 @@
     return { url: undefined, failed };
   }
 
-  // coda con 2 richieste in parallelo
   const queue = [];
   let active = 0;
   function enqueue(job) {
@@ -208,7 +225,7 @@
   }
   const badges = (b) => b.flags.map((f) => `<span class="badge f-${f}">${FLAGS[f]}</span>`).join("");
 
-  function renderHome() {
+function renderHome() {
     const q = search.trim().toLowerCase();
     const visible = books.filter((b) => {
       for (const f of activeFilters) if (!b.flags.includes(f)) return false;
@@ -310,7 +327,6 @@
     }
   }
 
-  // immagini copertina: fade-in, fallback se mancanti o placeholder 1x1
   document.addEventListener("error", (e) => {
     const img = e.target;
     if (img.tagName === "IMG" && img.classList.contains("cover") && img.dataset.ph) img.outerHTML = img.dataset.ph;
@@ -322,18 +338,20 @@
     else img.classList.add("ready");
   }, true);
 
-  // ---------- form ----------
+  // ---------- form e scanner ----------
   function openForm(book) {
     const f = {
-      flags: ["da_leggere"], coverUrl: "", title: "", author: "", year: "", lentTo: "", returnDate: "",
+      flags: ["da_leggere"], coverUrl: "", title: "", author: "", year: "", isbn: "", lentTo: "", returnDate: "",
       rating: 0, review: "", feeling: "", feelingTags: [], dateRead: "", reread: false,
       ...(book ? JSON.parse(JSON.stringify(book)) : {}),
     };
     const modal = $("#modal");
 
-    // stato ricerca copertine nel form
     let cs = { state: "idle", list: [], msg: "" };
     let searchSeq = 0;
+    let isScanning = false;
+    let mediaStream = null;
+    let scanInterval = null;
 
     function coverBoxHTML() {
       const loading = cs.state === "loading";
@@ -344,10 +362,12 @@
       } else if (cs.state === "done") {
         picker = `<p class="small">Tocca la copertina giusta</p><div class="picker">${cs.list.map((c, i) => {
           const sel = f.coverUrl && String(f.coverUrl).includes(`/${c.id}-`);
-          return `<button type="button" class="pick${sel ? " sel" : ""}" data-pick="${c.id}" title="${esc(c.title)}${c.year ? " · " + c.year : ""}">
-            <img src="${coverImg(c.id, "M")}" alt="${esc(c.title)}" loading="lazy" onerror="this.closest('.pick').remove()">
-            ${i === 0 && c.ts >= 2 ? '<span class="best">Consigliata</span>' : ""}</button>`;
-        }).join("")}</div>`;
+          const titleAttr = c.year ? `${esc(c.title)} ·${c.year}` : esc(c.title);
+          const bestBadge = i === 0 && c.ts >= 2 ? '<span class="best">Consigliata</span>' : '';
+          return `<button type="button" class="pick${sel ? ' sel' : ''}" data-pick="${c.id}" title="${titleAttr}">
+            <img src="${coverImg(c.id, 'M')}" alt="${esc(c.title)}" loading="lazy" onerror="this.closest('.pick').remove()">
+            ${bestBadge}</button>`;
+        }).join('')}</div>`;
       } else if (cs.msg) {
         picker = `<p class="small">${esc(cs.msg)}</p>`;
       }
@@ -357,10 +377,12 @@
           ${f.coverUrl ? `<button type="button" class="small" data-nocover style="text-decoration:underline">Rimuovi copertina</button>` : ""}
         </div></div>${picker}`;
     }
+
     function renderCoverBox() {
       const box = $("#coverBox", modal);
       if (box) box.innerHTML = coverBoxHTML();
     }
+
     async function runCoverSearch() {
       sync();
       const title = f.title.trim(), author = f.author.trim();
@@ -376,11 +398,91 @@
       renderCoverBox();
     }
 
+    async function processISBN(isbnValue) {
+      sync();
+      const statusEl = $("#isbnStatus", modal);
+      if (statusEl) statusEl.textContent = "Ricerca libro in corso...";
+      const result = await fetchByISBN(isbnValue);
+      if (result) {
+        if (result.title) f.title = result.title;
+        if (result.author) f.author = result.author;
+        if (result.year) f.year = result.year;
+        if (result.coverUrl) f.coverUrl = result.coverUrl;
+        draw();
+      } else {
+        if (statusEl) statusEl.textContent = "Libro non trovato per questo ISBN.";
+      }
+    }
+
+    function stopScanner() {
+      if (scanInterval) { clearInterval(scanInterval); scanInterval = null; }
+      if (mediaStream) {
+        mediaStream.getTracks().forEach((track) => track.stop());
+        mediaStream = null;
+      }
+      isScanning = false;
+    }
+
+    async function startScanner() {
+      if (!("BarcodeDetector" in window)) {
+        alert("La scansione automatica tramite fotocamera non è supportata da questo browser. Inserisci l'ISBN manualmente.");
+        return;
+      }
+      sync();
+      isScanning = true;
+      draw();
+
+      try {
+        const video = $("#scannerVideo", modal);
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" }
+        });
+        video.srcObject = mediaStream;
+        await video.play();
+
+        const barcodeDetector = new BarcodeDetector({ formats: ["ean_13", "code_128"] });
+        scanInterval = setInterval(async () => {
+          try {
+            const barcodes = await barcodeDetector.detect(video);
+            if (barcodes.length > 0) {
+              const isbn = barcodes[0].rawValue;
+              stopScanner();
+              f.isbn = isbn;
+              draw();
+              processISBN(isbn);
+            }
+          } catch {}
+        }, 500);
+      } catch (err) {
+        stopScanner();
+        alert("Impossibile accedere alla fotocamera. Assicurati di aver dato i permessi.");
+        draw();
+      }
+    }
+
     function draw() {
       modal.innerHTML = `
         <div class="sheet">
           <div class="sheet-head"><h2>${book ? "Modifica libro" : "Nuovo libro"}</h2><button class="btn" data-close>✕</button></div>
           <form class="form" id="bookForm">
+            <div class="isbn-box">
+              <span style="font-size:14px;font-weight:700">Autocompila da ISBN</span>
+              ${isScanning ? `
+                <div class="scanner-container">
+                  <video id="scannerVideo" playsinline></video>
+                  <div class="scanner-guide"></div>
+                </div>
+                <button type="button" class="btn btn-ghost" data-stop-scan>Annulla scansione</button>
+              ` : `
+                <div class="isbn-row">
+                  <input class="field" name="isbn" value="${esc(f.isbn)}" placeholder="Codice ISBN (es. 978...)" style="flex:1">
+                  <button type="button" class="btn btn-sky" data-fetch-isbn>Cerca</button>
+                  <button type="button" class="btn btn-sun" data-start-scan title="Scansiona con fotocamera">📷 Scansiona</button>
+                </div>
+              `}
+              <span id="isbnStatus" class="small"></span>
+            </div>
+
             <div class="row">
               <label>Titolo *<input class="field" name="title" required value="${esc(f.title)}" placeholder="Kafka sulla spiaggia"></label>
               <label>Anno<input class="field" name="year" value="${esc(f.year)}" placeholder="2002"></label>
@@ -413,12 +515,11 @@
         </div>`;
     }
 
-    // keep typed values when redrawing
     function sync() {
       const form = $("#bookForm", modal);
       if (!form) return;
       const d = new FormData(form);
-      ["title", "author", "year", "lentTo", "returnDate", "dateRead", "review", "feeling"].forEach((k) => {
+      ["title", "author", "year", "isbn", "lentTo", "returnDate", "dateRead", "review", "feeling"].forEach((k) => {
         if (d.has(k)) f[k] = String(d.get(k));
       });
       if (d.has("feelingTags")) f.feelingTags = String(d.get("feelingTags")).split(",").map((t) => t.trim()).filter(Boolean);
@@ -441,14 +542,23 @@
         sync(); f.coverUrl = ""; renderCoverBox();
       } else if (t.hasAttribute?.("data-cover")) {
         runCoverSearch();
+      } else if (t.hasAttribute?.("data-start-scan")) {
+        startScanner();
+      } else if (t.hasAttribute?.("data-stop-scan")) {
+        stopScanner();
+        draw();
+      } else if (t.hasAttribute?.("data-fetch-isbn")) {
+        sync();
+        if (f.isbn) processISBN(f.isbn);
       }
     };
-    // ricerca automatica quando titolo e autore sono compilati
+
     modal.onfocusout = (e) => {
       if (!["title", "author"].includes(e.target.name) || f.coverUrl || cs.state !== "idle") return;
       sync();
       if (f.title.trim() && f.author.trim()) runCoverSearch();
     };
+
     modal.onsubmit = (e) => {
       e.preventDefault();
       sync();
@@ -460,6 +570,7 @@
         title: f.title.trim(),
         author: f.author.trim(),
         year: f.year.trim() || undefined,
+        isbn: f.isbn.trim() || undefined,
         flags: f.flags,
         coverUrl: f.coverUrl || undefined,
         coverChecked: f.coverUrl ? true : changed ? false : book?.coverChecked,
@@ -475,7 +586,13 @@
       close();
       upsert(out);
     };
-    function close() { searchSeq++; modal.hidden = true; modal.innerHTML = ""; }
+
+    function close() {
+      stopScanner();
+      searchSeq++;
+      modal.hidden = true;
+      modal.innerHTML = "";
+    }
 
     draw();
     modal.hidden = false;
@@ -513,7 +630,10 @@
     render();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !$("#modal").hidden) { $("#modal").hidden = true; $("#modal").innerHTML = ""; }
+    if (e.key === "Escape" && !$("#modal").hidden) {
+      const closeBtn = $("#modal [data-close]");
+      if (closeBtn) closeBtn.click();
+    }
   });
   window.addEventListener("hashchange", () => { render(); window.scrollTo(0, 0); });
 
