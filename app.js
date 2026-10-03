@@ -141,6 +141,27 @@
   }
 
   // ---------- fonti per la ricerca da ISBN ----------
+  // Indirizzo del proprio proxy (vedi worker.js), ad es. "https://isbn-proxy.tuonome.workers.dev".
+  // Se impostato, SBN e Google Books passano da lì: niente blocchi CORS e niente limite di richieste.
+  const ISBN_PROXY = "https://round-cloud-60d5.burba1996.workers.dev";
+  const viaProxy = (url) => (ISBN_PROXY ? `${ISBN_PROXY.replace(/\/$/, "")}/?url=${encodeURIComponent(url)}` : url);
+
+  const SOURCE_LABELS = {
+    fromSbn: "SBN",
+    fromOpenLibrary: "Open Library",
+    fromOpenLibraryEdition: "Open Library (edizione)",
+    fromGoogleBooks: "Google Books",
+  };
+  function describeErr(err) {
+    const msg = String(err && err.message);
+    if (msg === "404") return "nessun risultato";
+    if (msg === "429") return "limite di richieste raggiunto";
+    if (err instanceof TypeError) return "bloccata dal browser o offline";
+    if (err && err.name === "AbortError") return "troppo lenta";
+    return "errore";
+  }
+  let lastLookupReport = "";
+
   // Catalogo SBN (Servizio Bibliotecario Nazionale): il database delle biblioteche italiane.
   // I titoli sono in formato ISBD ("Titolo : sottotitolo / responsabilità") e gli autori "Cognome, Nome".
   const isItalianIsbn = (isbn) => /^(97888|97912)/.test(isbn);
@@ -170,6 +191,7 @@
   let sbnDirectBlocked = false;
 
   async function getSbnJSON(url) {
+    if (ISBN_PROXY) return getJSON(viaProxy(url), 8000);
     if (!sbnDirectBlocked) {
       try { return await getJSON(url, 6000); }
       catch (err) {
@@ -247,19 +269,22 @@
     // le richieste che falliscono (es. limite di richieste) non fermano gli altri tentativi.
     const isbn10 = isbn13to10(isbn);
     const queries = [`isbn:${isbn}`, ...(isbn10 ? [`isbn:${isbn10}`] : []), isbn];
-    let info = null;
+    let info = null, failures = 0, lastErr = null;
     for (const q of queries) {
       try {
-        const data = await getJSON(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=5`);
+        const data = await getJSON(viaProxy(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=5`));
         const items = data.items || [];
         const hit = items.find((it) => {
           const ids = ((it.volumeInfo && it.volumeInfo.industryIdentifiers) || []).map((x) => x.identifier);
           return ids.includes(isbn) || (isbn10 && ids.includes(isbn10));
         }) || (q.startsWith("isbn:") ? items[0] : null);
         if (hit && hit.volumeInfo && hit.volumeInfo.title) { info = hit.volumeInfo; break; }
-      } catch {}
+      } catch (err) { failures++; lastErr = err; }
     }
-    if (!info) return null;
+    if (!info) {
+      if (failures === queries.length) throw lastErr; // tutte le richieste fallite: non è "nessun risultato"
+      return null;
+    }
     const title = info.subtitle ? `${info.title}: ${info.subtitle}` : info.title;
     const author = (info.authors || []).join(", ");
     const year = ((info.publishedDate || "").match(/\d{4}/) || [])[0] || "";
@@ -278,19 +303,24 @@
       : [fromOpenLibrary, fromOpenLibraryEdition, fromGoogleBooks, fromSbn];
 
     let found = null;
+    const report = [];
     for (const source of sources) {
+      const label = SOURCE_LABELS[source.name] || source.name;
       try {
         const r = await source(cleanIsbn);
-        if (!r) continue;
+        if (!r) { report.push(`${label}: nessun risultato`); continue; }
+        report.push(`${label}: trovato`);
         if (!found) found = r;
         else { // completa i campi mancanti con la fonte successiva
           for (const k of ["title", "author", "year", "coverUrl"]) if (!found[k] && r[k]) found[k] = r[k];
         }
         if (found.title && found.author && found.year) break;
       } catch (err) { // fonte non raggiungibile o bloccata (es. CORS): si passa alla successiva
-        console.warn(`Ricerca ISBN: ${source.name} non riuscita`, err);
+        report.push(`${label}: ${describeErr(err)}`);
+        console.warn(`Ricerca ISBN: ${label} non riuscita`, err);
       }
     }
+    lastLookupReport = report.join(" · ");
     return found;
   }
 
@@ -624,7 +654,7 @@ function renderHome() {
         isbnMsg = "Libro trovato: controlla i dati e salva.";
         draw();
       } else {
-        setStatus("Libro non trovato per questo ISBN. Compila i dati a mano.");
+        setStatus(`Libro non trovato. ${lastLookupReport} — compila i dati a mano.`);
       }
     }
 
