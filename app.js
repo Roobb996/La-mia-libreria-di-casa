@@ -143,20 +143,105 @@
   async function fetchByISBN(isbn) {
     const cleanIsbn = isbn.replace(/[^0-9X]/gi, "");
     if (!cleanIsbn) return null;
+
+    // 1) Open Library
     try {
       const data = await getJSON(`https://openlibrary.org/api/books?bibkeys=ISBN:${cleanIsbn}&format=json&jscmd=data`);
       const bookData = data[`ISBN:${cleanIsbn}`];
-      if (!bookData) return null;
+      if (bookData && bookData.title) {
+        const title = bookData.title || "";
+        const author = bookData.authors ? bookData.authors.map((a) => a.name).join(", ") : "";
+        const year = bookData.publish_date ? (bookData.publish_date.match(/\d{4}/) || [])[0] || "" : "";
+        const coverUrl = bookData.cover ? bookData.cover.large || bookData.cover.medium : undefined;
+        return { title, author, year, coverUrl };
+      }
+    } catch {}
 
-      const title = bookData.title || "";
-      const author = bookData.authors ? bookData.authors.map((a) => a.name).join(", ") : "";
-      const year = bookData.publish_date ? (bookData.publish_date.match(/\d{4}/) || [])[0] || "" : "";
-      const coverUrl = bookData.cover ? bookData.cover.large || bookData.cover.medium : undefined;
+    // 2) Google Books (copre meglio le edizioni italiane)
+    try {
+      const data = await getJSON(`https://www.googleapis.com/books/v1/volumes?q=isbn:${cleanIsbn}&maxResults=1`);
+      const info = data.items && data.items[0] && data.items[0].volumeInfo;
+      if (info && info.title) {
+        const title = info.subtitle ? `${info.title}: ${info.subtitle}` : info.title;
+        const author = (info.authors || []).join(", ");
+        const year = ((info.publishedDate || "").match(/\d{4}/) || [])[0] || "";
+        const thumb = info.imageLinks && (info.imageLinks.thumbnail || info.imageLinks.smallThumbnail);
+        const coverUrl = thumb ? String(thumb).replace(/^http:/, "https:").replace("&edge=curl", "") : undefined;
+        return { title, author, year, coverUrl };
+      }
+    } catch {}
 
-      return { title, author, year, coverUrl };
-    } catch {
-      return null;
+    return null;
+  }
+
+  // ---------- scanner helpers ----------
+  // EAN-13 valido con prefisso 978/979 (= ISBN-13). Scarta altri codici a barre.
+  function isValidIsbn13(code) {
+    if (!/^97[89]\d{10}$/.test(code)) return false;
+    let sum = 0;
+    for (let i = 0; i < 12; i++) sum += Number(code[i]) * (i % 2 ? 3 : 1);
+    return (10 - (sum % 10)) % 10 === Number(code[12]);
+  }
+
+  // Safari/Chrome iOS non hanno BarcodeDetector: carichiamo ZXing solo quando serve.
+  const ZXING_URL = "https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js";
+  let zxingPromise = null;
+  function loadZXing() {
+    if (window.ZXing) return Promise.resolve(window.ZXing);
+    if (!zxingPromise) {
+      zxingPromise = new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = ZXING_URL;
+        s.async = true;
+        s.onload = () => (window.ZXing ? resolve(window.ZXing) : reject(new Error("ZXing mancante")));
+        s.onerror = () => reject(new Error("Caricamento ZXing non riuscito"));
+        document.head.appendChild(s);
+      }).catch((err) => { zxingPromise = null; throw err; });
     }
+    return zxingPromise;
+  }
+
+  // Restituisce una funzione async (sorgente video/immagine) => stringa ISBN | null
+  async function createDecoder() {
+    if ("BarcodeDetector" in window) {
+      try {
+        const bd = new BarcodeDetector({ formats: ["ean_13"] });
+        return async (source) => {
+          const codes = await bd.detect(source);
+          const hit = codes.find((c) => isValidIsbn13(c.rawValue));
+          return hit ? hit.rawValue : null;
+        };
+      } catch { /* formato non supportato: passiamo a ZXing */ }
+    }
+    const ZX = await loadZXing();
+    const hints = new Map();
+    hints.set(ZX.DecodeHintType.POSSIBLE_FORMATS, [ZX.BarcodeFormat.EAN_13]);
+    hints.set(ZX.DecodeHintType.TRY_HARDER, true);
+    const reader = new ZX.MultiFormatReader();
+    reader.setHints(hints);
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    return async (source, full = false) => {
+      const sw = source.videoWidth || source.naturalWidth || source.width;
+      const sh = source.videoHeight || source.naturalHeight || source.height;
+      if (!sw || !sh) return null;
+      // video: ritaglia la fascia centrale (dove sta il riquadro guida);
+      // foto: usa l'immagine intera. In entrambi i casi riduce la risoluzione.
+      const cw = full ? sw : Math.round(sw * 0.8), ch = full ? sh : Math.round(sh * 0.5);
+      const cx = Math.round((sw - cw) / 2), cy = Math.round((sh - ch) / 2);
+      const scale = Math.min(1, (full ? 1600 : 900) / cw);
+      canvas.width = Math.round(cw * scale);
+      canvas.height = Math.round(ch * scale);
+      ctx.drawImage(source, cx, cy, cw, ch, 0, 0, canvas.width, canvas.height);
+      try {
+        const lum = new ZX.HTMLCanvasElementLuminanceSource(canvas);
+        const bitmap = new ZX.BinaryBitmap(new ZX.HybridBinarizer(lum));
+        const text = reader.decode(bitmap).getText();
+        return isValidIsbn13(text) ? text : null;
+      } catch {
+        return null; // nessun codice in questo frame
+      }
+    };
   }
 
   async function autoCover(title, author) {
@@ -352,6 +437,14 @@ function renderHome() {
     let isScanning = false;
     let mediaStream = null;
     let scanInterval = null;
+    let scanSeq = 0;
+    let isbnMsg = "";
+
+    function setStatus(msg) {
+      isbnMsg = msg;
+      const el = $("#isbnStatus", modal);
+      if (el) el.textContent = msg;
+    }
 
     function coverBoxHTML() {
       const loading = cs.state === "loading";
@@ -400,21 +493,23 @@ function renderHome() {
 
     async function processISBN(isbnValue) {
       sync();
-      const statusEl = $("#isbnStatus", modal);
-      if (statusEl) statusEl.textContent = "Ricerca libro in corso...";
+      setStatus("Ricerca libro in corso…");
       const result = await fetchByISBN(isbnValue);
+      if (modal.hidden) return;
       if (result) {
         if (result.title) f.title = result.title;
         if (result.author) f.author = result.author;
         if (result.year) f.year = result.year;
         if (result.coverUrl) f.coverUrl = result.coverUrl;
+        isbnMsg = "Libro trovato: controlla i dati e salva.";
         draw();
       } else {
-        if (statusEl) statusEl.textContent = "Libro non trovato per questo ISBN.";
+        setStatus("Libro non trovato per questo ISBN. Compila i dati a mano.");
       }
     }
 
     function stopScanner() {
+      scanSeq++; // annulla eventuali avvii ancora in corso
       if (scanInterval) { clearInterval(scanInterval); scanInterval = null; }
       if (mediaStream) {
         mediaStream.getTracks().forEach((track) => track.stop());
@@ -423,40 +518,99 @@ function renderHome() {
       isScanning = false;
     }
 
+    function gotIsbn(isbn) {
+      stopScanner();
+      f.isbn = isbn;
+      isbnMsg = "";
+      draw();
+      processISBN(isbn);
+    }
+
     async function startScanner() {
-      if (!("BarcodeDetector" in window)) {
-        alert("La scansione automatica tramite fotocamera non è supportata da questo browser. Inserisci l'ISBN manualmente.");
+      // Senza getUserMedia (pagina non HTTPS o browser molto vecchio) si passa alla foto.
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        const input = $("#isbnPhoto", modal);
+        setStatus(window.isSecureContext
+          ? "Fotocamera live non disponibile: scatta una foto del codice."
+          : "La fotocamera live richiede HTTPS: scatta una foto del codice.");
+        if (input) input.click();
         return;
       }
       sync();
+      stopScanner();
+      const seq = scanSeq;
       isScanning = true;
+      isbnMsg = "Avvio fotocamera…";
       draw();
 
+      let stream = null;
       try {
-        const video = $("#scannerVideo", modal);
-        mediaStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "environment" }
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
         });
-        video.srcObject = mediaStream;
+        if (seq !== scanSeq) { stream.getTracks().forEach((t) => t.stop()); return; }
+        mediaStream = stream;
+
+        const video = $("#scannerVideo", modal);
+        video.muted = true; // iOS Safari richiede muted + playsinline per l'avvio automatico
+        video.setAttribute("playsinline", "");
+        video.srcObject = stream;
         await video.play();
 
-        const barcodeDetector = new BarcodeDetector({ formats: ["ean_13", "code_128"] });
+        // messa a fuoco continua dove disponibile (Chrome Android)
+        try {
+          const track = stream.getVideoTracks()[0];
+          const caps = track.getCapabilities ? track.getCapabilities() : {};
+          if (caps.focusMode && caps.focusMode.includes("continuous")) {
+            await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+          }
+        } catch {}
+
+        setStatus("Preparo il lettore…");
+        const decode = await createDecoder();
+        if (seq !== scanSeq) return;
+        setStatus("Inquadra il codice a barre sul retro del libro.");
+
+        let busy = false;
         scanInterval = setInterval(async () => {
+          if (busy || seq !== scanSeq) return;
+          busy = true;
           try {
-            const barcodes = await barcodeDetector.detect(video);
-            if (barcodes.length > 0) {
-              const isbn = barcodes[0].rawValue;
-              stopScanner();
-              f.isbn = isbn;
-              draw();
-              processISBN(isbn);
-            }
-          } catch {}
-        }, 500);
+            const isbn = await decode(video);
+            if (isbn && seq === scanSeq) gotIsbn(isbn);
+          } catch {} finally { busy = false; }
+        }, 300);
       } catch (err) {
+        if (seq !== scanSeq) { if (stream) stream.getTracks().forEach((t) => t.stop()); return; }
+        const name = err && err.name;
         stopScanner();
-        alert("Impossibile accedere alla fotocamera. Assicurati di aver dato i permessi.");
+        isbnMsg =
+          name === "NotAllowedError" || name === "SecurityError"
+            ? "Permesso negato: consenti l'accesso alla fotocamera nelle impostazioni del browser."
+            : name === "NotFoundError" || name === "OverconstrainedError"
+            ? "Nessuna fotocamera disponibile su questo dispositivo."
+            : "Impossibile avviare la scansione. Scatta una foto del codice o scrivi l'ISBN.";
         draw();
+      }
+    }
+
+    async function scanFromPhoto(file) {
+      sync();
+      setStatus("Leggo il codice dalla foto…");
+      const url = URL.createObjectURL(file);
+      try {
+        const img = new Image();
+        img.src = url;
+        await img.decode();
+        const decode = await createDecoder();
+        const isbn = await decode(img, true);
+        if (isbn) gotIsbn(isbn);
+        else setStatus("Codice non leggibile: avvicinati, tieni il codice ben a fuoco e riprova.");
+      } catch {
+        setStatus("Lettura non riuscita. Riprova oppure scrivi l'ISBN.");
+      } finally {
+        URL.revokeObjectURL(url);
       }
     }
 
@@ -469,18 +623,20 @@ function renderHome() {
               <span style="font-size:14px;font-weight:700">Autocompila da ISBN</span>
               ${isScanning ? `
                 <div class="scanner-container">
-                  <video id="scannerVideo" playsinline></video>
+                  <video id="scannerVideo" playsinline muted autoplay></video>
                   <div class="scanner-guide"></div>
                 </div>
                 <button type="button" class="btn btn-ghost" data-stop-scan>Annulla scansione</button>
               ` : `
                 <div class="isbn-row">
-                  <input class="field" name="isbn" value="${esc(f.isbn)}" placeholder="Codice ISBN (es. 978...)" style="flex:1">
+                  <input class="field" name="isbn" value="${esc(f.isbn)}" placeholder="Codice ISBN (es. 978...)" inputmode="numeric" autocomplete="off">
                   <button type="button" class="btn btn-sky" data-fetch-isbn>Cerca</button>
                   <button type="button" class="btn btn-sun" data-start-scan title="Scansiona con fotocamera">📷 Scansiona</button>
                 </div>
+                <button type="button" class="small linklike" data-photo>Oppure scatta una foto del codice a barre</button>
+                <input type="file" id="isbnPhoto" accept="image/*" capture="environment" hidden>
               `}
-              <span id="isbnStatus" class="small"></span>
+              <span id="isbnStatus" class="small" role="status" aria-live="polite">${esc(isbnMsg)}</span>
             </div>
 
             <div class="row">
@@ -544,13 +700,24 @@ function renderHome() {
         runCoverSearch();
       } else if (t.hasAttribute?.("data-start-scan")) {
         startScanner();
+      } else if (t.hasAttribute?.("data-photo")) {
+        const input = $("#isbnPhoto", modal);
+        if (input) input.click();
       } else if (t.hasAttribute?.("data-stop-scan")) {
         stopScanner();
+        isbnMsg = "";
         draw();
       } else if (t.hasAttribute?.("data-fetch-isbn")) {
         sync();
         if (f.isbn) processISBN(f.isbn);
       }
+    };
+
+    modal.onchange = (e) => {
+      if (e.target.id !== "isbnPhoto") return;
+      const file = e.target.files && e.target.files[0];
+      e.target.value = "";
+      if (file) scanFromPhoto(file);
     };
 
     modal.onfocusout = (e) => {
